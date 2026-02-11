@@ -16,6 +16,108 @@ class AdminPanelPage extends StatelessWidget {
           'Kontrol Paneli',
           style: TextStyle(color: Colors.white),
         ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.add_box),
+            tooltip: 'Test Makinesi Oluştur',
+            onPressed: () async {
+              // 1. ADIM: Test için veritabanına bir makine ekliyoruz
+              await FirebaseFirestore.instance
+                  .collection('machines')
+                  .doc('box_01')
+                  .set({
+                'id': 'box_01',
+                'status': 'idle', // Boşta
+                'location': 'Test Bölgesi',
+                'activeUser': null,
+              });
+
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                    content: Text('✅ Test makinesi (box_01) oluşturuldu!')),
+              );
+            },
+          ),
+          // 2. ADIM: SİMÜLASYON BUTONU (Sanki çöp atılmış gibi)
+          IconButton(
+            icon: const Icon(Icons.recycling, color: Colors.greenAccent),
+            tooltip: 'Atık Atıldı Simülasyonu',
+            onPressed: () async {
+              try {
+                // A. Makineye bak, kim var?
+                DocumentSnapshot machineDoc = await FirebaseFirestore.instance
+                    .collection('machines')
+                    .doc('box_01')
+                    .get();
+
+                if (!machineDoc.exists) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Makine bulunamadı!')));
+                  return;
+                }
+
+                Map<String, dynamic>? data =
+                    machineDoc.data() as Map<String, dynamic>?;
+                Map<String, dynamic>? activeUser = data?['activeUser'];
+
+                if (activeUser == null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('⚠️ Makine boşta! Önce QR ile bağlanın.'),
+                      backgroundColor: Colors.orange,
+                    ),
+                  );
+                  return;
+                }
+
+                String uid = activeUser['uid'];
+                double amount = 2.50; // Plastik fiyatı
+                String type = 'Plastik';
+
+                // B. Kullanıcıya puan ver (Transaction ile güvenli işlem)
+                await FirebaseFirestore.instance.runTransaction((transaction) async {
+                  DocumentReference userRef =
+                      FirebaseFirestore.instance.collection('users').doc(uid);
+                  
+                  DocumentSnapshot userSnapshot = await transaction.get(userRef);
+
+                  if (!userSnapshot.exists) return;
+
+                  double currentBalance = (userSnapshot['balance'] ?? 0).toDouble();
+                  int currentPoints = (userSnapshot['points'] ?? 0) as int;
+                  int currentRecycled = (userSnapshot['recycledItems'] ?? 0) as int;
+
+                  transaction.update(userRef, {
+                    'balance': currentBalance + amount,
+                    'points': currentPoints + 25, // 2.5 TL * 10 puan
+                    'recycledItems': currentRecycled + 1,
+                  });
+
+                  // İşlem Geçmişine Ekle
+                  DocumentReference newTxRef = userRef.collection('transactions').doc();
+                  transaction.set(newTxRef, {
+                    'type': type,
+                    'amount': amount,
+                    'createdAt': FieldValue.serverTimestamp(),
+                  });
+                });
+
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                        '✅ BAŞARILI: ${activeUser['email']} hesabına $amount TL yüklendi!'),
+                    backgroundColor: Colors.green,
+                  ),
+                );
+              } catch (e) {
+                print(e);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Hata: $e')),
+                );
+              }
+            },
+          ),
+        ],
       ),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance.collection('users').snapshots(),

@@ -3,6 +3,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:qr_code_scanner/qr_code_scanner.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'dart:io'; // Platform kontrolü için eklendi
+import 'dart:async'; // StreamSubscription için
 import 'main.dart';
 
 class HomePage extends StatefulWidget {
@@ -13,6 +15,9 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  StreamSubscription? _userSubscription;
+  StreamSubscription? _transactionSubscription;
+
   double _balance = 0;
   int _points = 0;
   int _recycledItems = 0;
@@ -21,122 +26,214 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    _loadUserData();
-    _loadTransactions();
+    _listenToUserData();
+    _listenToTransactions();
   }
 
-  Future<void> _loadUserData() async {
+  @override
+  void dispose() {
+    _userSubscription?.cancel();
+    _transactionSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _listenToUserData() {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
-    final doc = await FirebaseFirestore.instance
+    _userSubscription = FirebaseFirestore.instance
         .collection('users')
         .doc(user.uid)
-        .get();
-
-    if (doc.exists) {
-      setState(() {
-        _balance = (doc['balance'] ?? 0).toDouble();
-        _points = doc['points'] ?? 0;
-        _recycledItems = doc['recycledItems'] ?? 0;
-      });
-    }
+        .snapshots()
+        .listen((doc) {
+      if (doc.exists && mounted) {
+        setState(() {
+          _balance = (doc['balance'] ?? 0).toDouble();
+          _points = (doc['points'] ?? 0).toInt();
+          _recycledItems = (doc['recycledItems'] ?? 0).toInt();
+        });
+      }
+    }, onError: (e) {
+      debugPrint("Kullanıcı verisi dinleme hatası: $e");
+    });
   }
 
-  Future<void> _loadTransactions() async {
+  void _listenToTransactions() {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
-    try {
-      final querySnapshot = await FirebaseFirestore.instance
-          .collection('users')
-          .doc(user.uid)
-          .collection('transactions')
-          .orderBy('createdAt', descending: true)
-          .limit(5)
-          .get();
+    _transactionSubscription = FirebaseFirestore.instance
+        .collection('users')
+        .doc(user.uid)
+        .collection('transactions')
+        .orderBy('createdAt', descending: true)
+        .limit(5)
+        .snapshots()
+        .listen((snapshot) {
+      if (mounted) {
+        setState(() {
+          _transactions.clear();
+          for (var doc in snapshot.docs) {
+            final data = doc.data();
+            final type = data['type'] ?? 'Bilinmeyen';
+            final amount = (data['amount'] ?? 0).toDouble();
+            final createdAt = data['createdAt'] as Timestamp?;
 
-      setState(() {
-        _transactions.clear();
-        for (var doc in querySnapshot.docs) {
-          final data = doc.data();
-          final type = data['type'] ?? 'Bilinmeyen';
-          final amount = (data['amount'] ?? 0).toDouble();
-          final createdAt = data['createdAt'] as Timestamp?;
-
-          _transactions.add(RecycleTransaction(
-            type,
-            amount,
-            createdAt?.toDate() ?? DateTime.now(),
-            _getIconForType(type),
-          ));
-        }
-      });
-    } catch (e) {
-      print('İşlem geçmişi yüklenirken hata: $e');
-    }
+            _transactions.add(RecycleTransaction(
+              type,
+              amount,
+              createdAt?.toDate() ?? DateTime.now(),
+              _getIconForType(type),
+            ));
+          }
+        });
+      }
+    }, onError: (e) {
+      debugPrint("İşlem geçmişi dinleme hatası: $e");
+    });
   }
 
-//burada Qr ayarlama işlemi yapılmaktadır.
-  void _handleQrResult(String machineId) {
-    debugPrint("GELEN MACHINE ID: $machineId");
+  //burada Qr ayarlama işlemi yapılmaktadır.
+  void _handleQrResult(String rawQrCode) async {
+    debugPrint("GELEN QR KOD: $rawQrCode");
 
+    // 1. Machine ID Temizleme (URL veya boşluk varsa temizle)
+    String machineId = rawQrCode;
+    if (machineId.contains('/')) {
+      machineId = machineId.split('/').last;
+    }
+    machineId = machineId.trim();
+
+    debugPrint("TEMİZLENMİŞ MACHINE ID: $machineId");
+
+    if (machineId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Geçersiz QR Kod!")),
+      );
+      return;
+    }
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Oturum açmış kullanıcı bulunamadı!")),
+      );
+      return;
+    }
+
+    // 2. Kullanıcıya "Bağlanıyor..." de
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text("Makine Bulundu"),
-        content: Text("Makine ID: $machineId"),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("Tamam"),
-          ),
-        ],
+      barrierDismissible: false,
+      builder: (context) => const Center(
+        child: CircularProgressIndicator(color: Colors.white),
       ),
     );
+
+    try {
+      // 3. Makine ile el sıkışma (Handshake)
+      // Zaman aşımı ekleyerek ekranın kararıp kalmasını önlüyoruz
+      await FirebaseFirestore.instance
+          .collection('machines')
+          .doc(machineId)
+          .set({
+        'activeUser': {
+          'uid': user.uid,
+          'email': user.email,
+          'timestamp': FieldValue.serverTimestamp(),
+        },
+        'status': 'active',
+      }, SetOptions(merge: true)).timeout(const Duration(seconds: 10), onTimeout: () {
+        throw TimeoutException("Sunucuya bağlanılamadı. Lütfen internetinizi kontrol edin.");
+      });
+
+      if (!mounted) return;
+      Navigator.of(context, rootNavigator: true).pop(); // Diyaloğu güvenli kapat
+
+      // 4. Başarılı olduğunu söyle
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          backgroundColor: const Color(0xFF455A64),
+          title: const Text("Makineye Bağlandı! ✅",
+              style: TextStyle(color: Colors.white)),
+          content: Text(
+            "Makine ID: $machineId\n\nLütfen atığınızı **$machineId** numaralı makineye atın.\n\nPuanınız otomatik olarak hesabınıza yansıyacak.",
+            style: const TextStyle(color: Colors.white70),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("Tamam", style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      try {
+        Navigator.of(context, rootNavigator: true).pop();
+      } catch (_) {}
+      
+      String errorMsg = e.toString();
+      if (errorMsg.contains("permission-denied")) {
+        errorMsg = "Firebase Firestore yetki hatası! Firestore kurallarınızı kontrol edin.";
+      }
+      
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text("Hata"),
+          content: Text("Makineye bağlanılamadı:\n$e"),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("Tamam"),
+            ),
+          ],
+        ),
+      );
+    }
   }
 
   void _recycleItem(String type, double amount) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
-    setState(() {
-      _balance += amount;
-      _points += (amount * 10).toInt();
-      _recycledItems += 1;
-      _transactions.insert(
-          0,
-          RecycleTransaction(
-              type, amount, DateTime.now(), _getIconForType(type)));
+    // Firestore'da atomik güncelleme yapıyoruz (FieldValue.increment)
+    // Stream dinleyicisi (listener) sayesinde UI otomatik güncellenecek.
+    
+    try {
+      // 1. Kullanıcı bakiyesini güncelle
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+        'balance': FieldValue.increment(amount),
+        'points': FieldValue.increment((amount * 10).toInt()),
+        'recycledItems': FieldValue.increment(1),
+      }, SetOptions(merge: true));
 
-      if (_transactions.length > 5) {
-        _transactions.removeRange(5, _transactions.length);
-      }
-    });
+      // 2. İşlem geçmişine ekle
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('transactions')
+          .add({
+        'type': type,
+        'amount': amount,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
 
-    await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
-      'balance': _balance,
-      'points': _points,
-      'recycledItems': _recycledItems,
-    }, SetOptions(merge: true));
-
-    await FirebaseFirestore.instance
-        .collection('users')
-        .doc(user.uid)
-        .collection('transactions')
-        .add({
-      'type': type,
-      'amount': amount,
-      'createdAt': FieldValue.serverTimestamp(),
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content:
-            Text('$type geri dönüştürüldü! +₺${amount.toStringAsFixed(2)}'),
-        backgroundColor: Colors.green,
-      ),
-    );
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content:
+              Text('$type geri dönüştürüldü! +₺${amount.toStringAsFixed(2)}'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Hata oluştu: $e'), backgroundColor: Colors.red),
+      );
+    }
   }
 
   IconData _getIconForType(String type) {
@@ -185,6 +282,36 @@ class _HomePageState extends State<HomePage> {
         ),
       );
     }
+  }
+
+  // TEST İÇİN: Elle Kod Girme
+  void _showManualEntryDialog() {
+    final TextEditingController _codeController = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Manuel Kod Girişi"),
+        content: TextField(
+          controller: _codeController,
+          decoration: const InputDecoration(hintText: "Örn: box_01"),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("İptal"),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              if (_codeController.text.isNotEmpty) {
+                _handleQrResult(_codeController.text.trim());
+              }
+            },
+            child: const Text("Bağlan"),
+          ),
+        ],
+      ),
+    );
   }
 
   void _viewAllTransactions() async {
@@ -352,18 +479,29 @@ class _HomePageState extends State<HomePage> {
                         ),
                       ],
                     ),
-                    IconButton(
-                      onPressed: _logout,
-                      icon: Icon(Icons.logout,
-                          color: Colors.white, size: 22), // size eklendi
-                      style: IconButton.styleFrom(
-                        backgroundColor: Colors.indigo[700]!.withOpacity(0.8),
-                        shape: RoundedRectangleBorder(
-                          borderRadius:
-                              BorderRadius.circular(10), // 12'den 10'a
+                    Row(
+                      children: [
+                        // TEST İÇİN: Elle Kod Girme Butonu
+                        IconButton(
+                          icon: const Icon(Icons.keyboard, color: Colors.white),
+                          onPressed: () {
+                             _showManualEntryDialog();
+                          },
                         ),
-                        padding: const EdgeInsets.all(10), // 12'den 10'a
-                      ),
+                        IconButton(
+                          onPressed: _logout,
+                          icon: Icon(Icons.logout,
+                              color: Colors.white, size: 22), // size eklendi
+                          style: IconButton.styleFrom(
+                            backgroundColor: Colors.indigo[700]!.withOpacity(0.8),
+                            shape: RoundedRectangleBorder(
+                              borderRadius:
+                                  BorderRadius.circular(10), // 12'den 10'a
+                            ),
+                            padding: const EdgeInsets.all(10), // 12'den 10'a
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -777,6 +915,18 @@ class _QRScannerPageState extends State<QRScannerPage> {
   final GlobalKey qrKey = GlobalKey(debugLabel: 'QR');
   QRViewController? controller;
 
+  // Çift okumayı engellemek için kilit
+  bool _isScanned = false; 
+
+  @override
+  void reassemble() {
+    super.reassemble();
+    if (Platform.isAndroid) {
+      controller!.pauseCamera();
+    }
+    controller!.resumeCamera();
+  }
+
   @override
   void dispose() {
     controller?.dispose();
@@ -786,17 +936,23 @@ class _QRScannerPageState extends State<QRScannerPage> {
   void _onQRViewCreated(QRViewController controller) {
     this.controller = controller;
 
-    controller.scannedDataStream.listen((scanData) {
+    controller.scannedDataStream.listen((scanData) async {
+      // Eğer daha önce okunduysa tekrar işlem yapma
+      if (_isScanned) return;
+
       final qrResult = scanData.code;
 
       if (qrResult != null && qrResult.isNotEmpty) {
-        controller.pauseCamera();
-
-        // QR sonucu LOG
+        setState(() {
+          _isScanned = true; // Kilitle
+        });
+        
+        await controller.pauseCamera();
         debugPrint("QR OKUNDU: $qrResult");
 
-        // HomePage'e geri gönder
-        Navigator.pop(context, qrResult);
+        if (mounted) {
+          Navigator.pop(context, qrResult);
+        }
       }
     });
   }
@@ -813,7 +969,7 @@ class _QRScannerPageState extends State<QRScannerPage> {
           onPressed: () => Navigator.pop(context),
         ),
         title: const Text(
-          'Kamera',
+          'QR Kodu Okutun',
           style: TextStyle(color: Colors.white),
         ),
       ),
@@ -821,7 +977,7 @@ class _QRScannerPageState extends State<QRScannerPage> {
         key: qrKey,
         onQRViewCreated: _onQRViewCreated,
         overlay: QrScannerOverlayShape(
-          borderColor: Colors.indigo,
+          borderColor: Colors.greenAccent, // GÜNCELLEME KONTROLÜ: YEŞİL RENK
           borderRadius: 10,
           borderLength: 30,
           borderWidth: 10,
